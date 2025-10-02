@@ -14,6 +14,10 @@ import System.IO.Error (catchIOError)
 import Control.Exception (bracket)
 import Foreign (FunPtr)
 import GHC.Conc (asyncDoProc)
+# if defined(__IO_MANAGER_WINIO__)
+import qualified GHC.Event.Windows as Mgr
+import Foreign.Ptr (wordPtrToPtr)
+# endif
 #else
 import Foreign.C.Error (getErrno, eINTR, eINPROGRESS)
 import GHC.Conc (threadWaitWrite)
@@ -79,6 +83,11 @@ socket family stype protocol = E.bracketOnError create c_close $ \fd -> do
     -- Let's ensure that the socket (file descriptor) is closed even on
     -- asynchronous exceptions.
     setNonBlock fd
+#if defined(mingw32_HOST_OS) && defined(__IO_MANAGER_WINIO__)
+    -- Associate socket with WinIO I/O manager immediately
+    -- CSocket is CULong on Windows, HANDLE is Ptr ()
+    Mgr.associateHandle' (wordPtrToPtr $ fromIntegral fd)
+#endif
     s <- mkSocket fd
     -- This socket is not managed by the IO manager yet.
     -- So, we don't have to call "close" which uses "closeFdWith".
