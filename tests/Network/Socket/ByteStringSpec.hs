@@ -200,7 +200,6 @@ spec = do
                 seg2 = C.pack "test message."
             udpTest client server
 
-{-
     describe "recvMsg" $ do
         it "works well" $ do
             let server sock = do
@@ -313,4 +312,3 @@ spec = do
 
                 seg = C.pack "This is a test message"
             udpTest client server
--}
