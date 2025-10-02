@@ -30,11 +30,9 @@ import GHC.IO.FD (FD(..), readRawBufferPtr, writeRawBufferPtr)
 import Network.Socket.Win32.CmsgHdr
 import Network.Socket.Win32.MsgHdr
 import Network.Socket.Win32.WSABuf
-# if defined(__IO_MANAGER_WINIO__)
 import qualified GHC.Event.Windows as Mgr
 import GHC.IO.SubSystem ((<!>))
 import Foreign.Ptr (wordPtrToPtr)
-# endif
 #else
 import Network.Socket.Posix.CmsgHdr
 import Network.Socket.Posix.MsgHdr
@@ -47,6 +45,7 @@ import Network.Socket.Name
 import Network.Socket.Types
 import Network.Socket.Flag
 
+import GHC.IO.SubSystem
 #if defined(mingw32_HOST_OS)
 type DWORD   = Word32
 type LPDWORD = Ptr DWORD
@@ -148,12 +147,8 @@ recvBuf s ptr nbytes
  | nbytes <= 0 = ioError (mkInvalidRecvArgError "Network.Socket.recvBuf")
  | otherwise   = do
 #if defined(mingw32_HOST_OS)
-# if defined(__IO_MANAGER_WINIO__)
     -- Use MIO (old) or WinIO (new) implementation
     recvBufMIO s ptr nbytes <!> recvBufWinIO s ptr nbytes
-# else
-    recvBufMIO s ptr nbytes
-# endif
 #else
     len <- withFdSocket s $ \fd ->
         throwSocketErrorWaitRead s "Network.Socket.recvBuf" $
@@ -172,21 +167,28 @@ recvBufMIO s ptr nbytes = do
              readRawBufferPtr "Network.Socket.recvBuf" fd ptr 0 cnbytes
     return $ fromIntegral len
 
-# if defined(__IO_MANAGER_WINIO__)
 -- WinIO implementation using withOverlapped
 recvBufWinIO :: Socket -> Ptr Word8 -> Int -> IO Int
 recvBufWinIO s ptr nbytes = withFdSocket s $ \fd -> do
     -- Perform async recv using withOverlapped
     -- (socket already associated in socket creation)
     let handle = wordPtrToPtr $ fromIntegral fd
-        startCB lpOverlapped = do
-          alloca $ \bytesRecvd -> do
-            alloca $ \flags -> do
-              poke flags 0
-              let wsaBuf = WSABuf (castPtr ptr) (fromIntegral nbytes)
-              with wsaBuf $ \pWsaBuf -> do
-                ret <- c_WSARecv fd pWsaBuf 1 bytesRecvd flags lpOverlapped nullPtr
-                return $ Mgr.CbNone ret
+        startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
+        startCB lpOverlapped = alloca $ \bytesRecvd -> do
+          alloca $ \flags -> do
+            poke flags 0
+            let wsaBuf = WSABuf (castPtr ptr) (fromIntegral nbytes)
+            with wsaBuf $ \pWsaBuf -> do
+              ret <- c_WSARecv fd pWsaBuf 1 bytesRecvd flags (castPtr lpOverlapped) nullPtr
+              -- IMPORTANT: Must get error immediately after WSARecv before any other IO!
+              err <- if ret == (-1) then c_WSAGetLastError else return 0
+              if ret == 0
+                then do
+                  bytes <- peek bytesRecvd
+                  return $ Mgr.CbDone (Just $ fromIntegral bytes)  -- Immediate success
+                else if err == #{const ERROR_IO_PENDING}
+                  then return Mgr.CbPending  -- Async pending (will be completed by I/O manager)
+                  else return $ Mgr.CbError (fromIntegral err)   -- Actual error
     fmap fromIntegral $ Mgr.withException "recvBuf" $
       Mgr.withOverlapped "recvBuf" handle 0 startCB completionCB
   where
@@ -198,7 +200,6 @@ recvBufWinIO s ptr nbytes = withFdSocket s $ \fd -> do
       | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0  -- Socket was shut down
       | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0  -- Graceful shutdown
       | otherwise                        = Mgr.ioFailed err
-# endif
 #endif
 
 -- | Receive data from the socket. This function returns immediately
@@ -333,12 +334,8 @@ recvBufMsg s bufsizs clen flags = do
                 throwSocketErrorWaitRead s "Network.Socket.Buffer.recvmsg" $
                       c_recvmsg fd msgHdrPtr _cflags
 #else
-# if defined(__IO_MANAGER_WINIO__)
                 -- Use MIO or WinIO implementation
                 (recvMsgMIO fd msgHdrPtr <!> recvMsgWinIO fd msgHdrPtr)
-# else
-                recvMsgMIO fd msgHdrPtr
-# endif
 #endif
             sockaddr <- peekSocketAddress addrPtr `catchIOError` \_ -> getPeerName s
             hdr <- peek msgHdrPtr
@@ -373,15 +370,24 @@ recvMsgMIO fd msgHdrPtr = alloca $ \len_ptr -> do
             c_recvmsg fd msgHdrPtr len_ptr nullPtr nullPtr
     fromIntegral <$> peek len_ptr
 
-# if defined(__IO_MANAGER_WINIO__)
 recvMsgWinIO :: CSocket -> Ptr (MsgHdr sa) -> IO Int
 recvMsgWinIO fd msgHdrPtr = do
     -- Perform async WSARecvMsg using withOverlapped
     -- (socket already associated in socket creation)
     let handle = wordPtrToPtr $ fromIntegral fd
+        startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
         startCB lpOverlapped = alloca $ \pBytesRecvd -> do
-          ret <- c_recvmsg fd msgHdrPtr pBytesRecvd lpOverlapped nullPtr
-          return $ Mgr.CbNone ret
+          ret <- c_recvmsg fd msgHdrPtr pBytesRecvd (castPtr lpOverlapped) nullPtr
+          -- IMPORTANT: Must get error immediately after WSARecvMsg before any other IO!
+          err <- if ret == (-1) then c_WSAGetLastError else return 0
+          if ret == 0
+            then do
+              bytes <- peek pBytesRecvd
+              return $ Mgr.CbDone (Just $ fromIntegral bytes)  -- Immediate success
+            else do
+              if err == #{const ERROR_IO_PENDING}
+                then return Mgr.CbPending  -- Async pending (will be completed by I/O manager)
+                else return $ Mgr.CbError (fromIntegral err)   -- Actual error
     fmap fromIntegral $ Mgr.withException "recvMsg" $
       Mgr.withOverlapped "recvMsg" handle 0 startCB completionCB
   where
@@ -394,7 +400,6 @@ recvMsgWinIO fd msgHdrPtr = do
       | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0  -- Socket shut down
       | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0  -- Graceful shutdown
       | otherwise                        = Mgr.ioFailed err
-# endif
 #endif
 
 foreign import ccall unsafe "recv"
