@@ -14,9 +14,11 @@ import System.IO.Error (catchIOError)
 import Control.Exception (bracket)
 import Foreign (FunPtr)
 import GHC.Conc (asyncDoProc)
+# if defined(HAS_WINIO)
 import qualified GHC.Event.Windows as Mgr
 import Foreign.Ptr (wordPtrToPtr)
 import GHC.IO.SubSystem ((<!>))
+# endif
 #else
 import Foreign.C.Error (getErrno, eINTR, eINPROGRESS)
 import GHC.Conc (threadWaitWrite)
@@ -82,7 +84,7 @@ socket family stype protocol = E.bracketOnError create c_close $ \fd -> do
     -- Let's ensure that the socket (file descriptor) is closed even on
     -- asynchronous exceptions.
     setNonBlock fd
-#if defined(mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS) && defined(HAS_WINIO)
     -- Associate socket with I/O manager immediately if using WinIO
     -- MIO doesn't need association (returns ()), WinIO does
     -- CSocket is CULong on Windows, HANDLE is Ptr ()
