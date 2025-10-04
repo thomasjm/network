@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase #-}
 
 ##include "HsNetDef.h"
 #if defined(mingw32_HOST_OS)
@@ -30,6 +31,11 @@ import GHC.IO.FD (FD(..), readRawBufferPtr, writeRawBufferPtr)
 import Network.Socket.Win32.CmsgHdr
 import Network.Socket.Win32.MsgHdr
 import Network.Socket.Win32.WSABuf
+# if defined(HAS_WINIO)
+import qualified GHC.Event.Windows as Mgr
+import GHC.IO.SubSystem ((<!>))
+import Foreign.Ptr (wordPtrToPtr)
+# endif
 #else
 import Network.Socket.Posix.CmsgHdr
 import Network.Socket.Posix.MsgHdr
@@ -71,7 +77,8 @@ socket2FD :: Socket -> IO FD
 socket2FD s = do
   fd <- unsafeFdSocket s
   -- HACK, 1 means True
-  return $ FD{ fdFD = fd, fdIsSocket_ = 1 }
+  -- TODO: remove fromIntegral for WinIO
+  return $ FD{ fdFD = fromIntegral fd, fdIsSocket_ = 1 }
 #endif
 
 -- | Send data to the socket. The socket must be connected to a remote
@@ -142,17 +149,59 @@ recvBuf s ptr nbytes
  | nbytes <= 0 = ioError (mkInvalidRecvArgError "Network.Socket.recvBuf")
  | otherwise   = do
 #if defined(mingw32_HOST_OS)
--- see comment in sendBuf above.
-    fd <- socket2FD s
-    let cnbytes = fromIntegral nbytes
-    len <- throwSocketErrorIfMinus1Retry "Network.Socket.recvBuf" $
-             readRawBufferPtr "Network.Socket.recvBuf" fd ptr 0 cnbytes
+# if defined(HAS_WINIO)
+    recvBufMIO s ptr nbytes <!> recvBufWinIO s ptr nbytes
+# else
+    recvBufMIO s ptr nbytes
+# endif
 #else
     len <- withFdSocket s $ \fd ->
         throwSocketErrorWaitRead s "Network.Socket.recvBuf" $
              c_recv fd (castPtr ptr) (fromIntegral nbytes) 0{-flags-}
-#endif
     return $ fromIntegral len
+#endif
+
+#if defined(mingw32_HOST_OS)
+-- MIO (old I/O manager) implementation
+recvBufMIO :: Socket -> Ptr Word8 -> Int -> IO Int
+recvBufMIO s ptr nbytes = do
+    -- see comment in sendBuf above.
+    fd <- socket2FD s
+    let cnbytes = fromIntegral nbytes
+    len <- throwSocketErrorIfMinus1Retry "Network.Socket.recvBuf" $
+             readRawBufferPtr "Network.Socket.recvBuf" fd ptr 0 cnbytes
+    return $ fromIntegral len
+
+# if defined(HAS_WINIO)
+-- WinIO implementation using withOverlapped
+recvBufWinIO :: Socket -> Ptr Word8 -> Int -> IO Int
+recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
+    fmap fromIntegral $ Mgr.withException "recvBuf" $
+      Mgr.withOverlapped "recvBuf" (wordPtrToPtr $ fromIntegral sock) 0 (startCB sock) completionCB
+  where
+    startCB :: CSocket -> Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
+    startCB sock lpOverlapped = alloca $ \bytesRecvd -> do
+      alloca $ \flags -> do
+        poke flags 0
+        with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
+          c_WSARecv sock pWsaBuf 1 bytesRecvd flags (castPtr lpOverlapped) nullPtr >>= \case
+            0 -> do
+              bytes <- peek bytesRecvd
+              return $ Mgr.CbDone (Just $ fromIntegral bytes)  -- Immediate success
+            ret -> do
+              -- IMPORTANT: Must get error immediately after WSARecv before any other IO!
+              err <- if ret == (-1) then c_WSAGetLastError else return 0
+              if err == #{const ERROR_IO_PENDING} then return Mgr.CbPending else return $ Mgr.CbError (fromIntegral err)
+
+    completionCB err dwBytes
+      | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
+      | err == #{const WSAECONNRESET}    = Mgr.ioSuccess 0  -- Treat connection reset as EOF
+      | err == #{const WSAECONNABORTED}  = Mgr.ioSuccess 0  -- Treat connection aborted as EOF
+      | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0  -- Socket was shut down
+      | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0  -- Graceful shutdown
+      | otherwise                        = Mgr.ioFailed err
+# endif /* HAS_WINIO */
+#endif /* mingw32_HOST_OS */
 
 -- | Receive data from the socket. This function returns immediately
 --   even if data is not available. In other words, IO manager is NOT
@@ -280,15 +329,17 @@ recvBufMsg s bufsizs clen flags = do
             _cflags = fromMsgFlag flags
         withFdSocket s $ \fd -> do
           with msgHdr $ \msgHdrPtr -> do
-            len <- (fmap fromIntegral) <$>
+            len <-
 #if !defined(mingw32_HOST_OS)
+                fmap fromIntegral <$>
                 throwSocketErrorWaitRead s "Network.Socket.Buffer.recvmsg" $
                       c_recvmsg fd msgHdrPtr _cflags
 #else
-                alloca $ \len_ptr -> do
-                    _ <- throwSocketErrorWaitReadBut (== #{const WSAEMSGSIZE}) s "Network.Socket.Buffer.recvmsg" $
-                            c_recvmsg fd msgHdrPtr len_ptr nullPtr nullPtr
-                    peek len_ptr
+# if defined(HAS_WINIO)
+                (recvBufMsgMIO fd msgHdrPtr <!> recvBufMsgWinIO fd msgHdrPtr)
+# else
+                recvBufMsgMIO fd msgHdrPtr
+# endif
 #endif
             sockaddr <- peekSocketAddress addrPtr `catchIOError` \_ -> getPeerName s
             hdr <- peek msgHdrPtr
@@ -313,6 +364,49 @@ foreign import CALLCONV SAFE_ON_WIN "WSASendMsg"
   c_sendmsg :: CSocket -> Ptr (MsgHdr sa) -> DWORD -> LPDWORD -> Ptr () -> Ptr ()  -> IO CInt
 foreign import CALLCONV SAFE_ON_WIN "WSARecvMsg"
   c_recvmsg :: CSocket -> Ptr (MsgHdr sa) -> LPDWORD -> Ptr () -> Ptr () -> IO CInt
+foreign import CALLCONV unsafe "WSARecv"
+  c_WSARecv :: CSocket -> Ptr WSABuf -> DWORD -> LPDWORD -> LPDWORD -> Ptr () -> Ptr () -> IO CInt
+
+-- Helper functions for recvBufMsg on Windows
+recvBufMsgMIO :: CSocket -> Ptr (MsgHdr sa) -> IO Int
+recvBufMsgMIO fd msgHdrPtr = alloca $ \len_ptr -> do
+    _ <- throwSocketErrorIfMinus1Retry "Network.Socket.Buffer.recvmsg" $
+            c_recvmsg fd msgHdrPtr len_ptr nullPtr nullPtr
+    fromIntegral <$> peek len_ptr
+
+# if defined(HAS_WINIO)
+recvBufMsgWinIO :: CSocket -> Ptr (MsgHdr sa) -> IO Int
+recvBufMsgWinIO fd msgHdrPtr = do
+    -- Perform async WSARecvMsg using withOverlapped
+    -- (socket already associated in socket creation)
+    let handle = wordPtrToPtr $ fromIntegral fd
+        startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
+        startCB lpOverlapped = alloca $ \pBytesRecvd -> do
+          ret <- c_recvmsg fd msgHdrPtr pBytesRecvd (castPtr lpOverlapped) nullPtr
+          -- IMPORTANT: Must get error immediately after WSARecvMsg before any other IO!
+          err <- if ret == (-1) then c_WSAGetLastError else return 0
+          if ret == 0
+            then do
+              bytes <- peek pBytesRecvd
+              return $ Mgr.CbDone (Just $ fromIntegral bytes)  -- Immediate success
+            else do
+              if err == #{const ERROR_IO_PENDING}
+                then return Mgr.CbPending  -- Async pending (will be completed by I/O manager)
+                else return $ Mgr.CbError (fromIntegral err)   -- Actual error
+    fmap fromIntegral $ Mgr.withException "recvMsg" $
+      Mgr.withOverlapped "recvMsg" handle 0 startCB completionCB
+  where
+
+    completionCB err dwBytes
+      | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
+      | err == #{const WSAEMSGSIZE}      = Mgr.ioSuccess $ fromIntegral dwBytes  -- Message was truncated but data received
+      | err == #{const WSAECONNRESET}    = Mgr.ioSuccess 0  -- Connection reset
+      | err == #{const WSAECONNABORTED}  = Mgr.ioSuccess 0  -- Connection aborted
+      | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0  -- Socket shut down
+      | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0  -- Graceful shutdown
+      | otherwise                        = Mgr.ioFailed err
+# endif /* HAS_WINIO */
+#endif /* mingw32_HOST_OS */
 
 foreign import ccall unsafe "recv"
   c_recv :: CSocket -> Ptr CChar -> CSize -> CInt -> IO CInt
