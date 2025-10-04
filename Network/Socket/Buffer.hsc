@@ -180,26 +180,44 @@ recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
       Mgr.withOverlapped "recvBuf" (wordPtrToPtr $ fromIntegral sock) 0 (startCB sock) completionCB
   where
     startCB :: CSocket -> Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
-    startCB sock lpOverlapped = alloca $ \bytesRecvd -> do
+    startCB sock lpOverlapped = do
       alloca $ \flags -> do
         poke flags 0
         with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
-          c_WSARecv sock pWsaBuf 1 bytesRecvd flags (castPtr lpOverlapped) nullPtr >>= \case
-            0 -> do
-              bytes <- peek bytesRecvd
-              return $ Mgr.CbDone (Just $ fromIntegral bytes)  -- Immediate success
+          c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr >>= \case
+            0 -> return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
             ret -> do
-              -- IMPORTANT: Must get error immediately after WSARecv before any other IO!
               err <- if ret == (-1) then c_WSAGetLastError else return 0
-              if err == #{const ERROR_IO_PENDING} then return Mgr.CbPending else return $ Mgr.CbError (fromIntegral err)
+              return $ if err == #{const ERROR_IO_PENDING} then Mgr.CbPending else Mgr.CbError (fromIntegral err)
 
     completionCB err dwBytes
-      | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
-      | err == #{const WSAECONNRESET}    = Mgr.ioSuccess 0  -- Treat connection reset as EOF
-      | err == #{const WSAECONNABORTED}  = Mgr.ioSuccess 0  -- Treat connection aborted as EOF
-      | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0  -- Socket was shut down
-      | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0  -- Graceful shutdown
-      | otherwise                        = Mgr.ioFailed err
+      -- https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv#return-value
+      | err == 996 = do
+          putStrLn "Matched ERROR_IO_INCOMPLETE (996)" -- TODO: ???
+          Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE: I/O operation incomplete (e.g., during shutdown)
+      | err == #{const WSAECONNABORTED} = Mgr.ioSuccess 0  -- Connection aborted
+      | err == #{const WSAECONNRESET} = Mgr.ioSuccess 0  -- Connection reset
+      | err == #{const WSAEDISCON} = Mgr.ioSuccess 0  -- Graceful shutdown
+      -- | err == #{const WSAEFAULT} = undefined
+      -- | err == #{const WSAEINPROGRESS} = undefined
+      -- | err == #{const WSAEINTR} = undefined
+      -- | err == #{const WSAEINVAL} = undefined
+      -- | err == #{const WSAEMSGSIZE} = undefined
+      -- | err == #{const WSAENETDOWN} = undefined
+      -- | err == #{const WSAENETRESET} = undefined
+      -- | err == #{const WSAENOTCONN} = undefined
+      -- | err == #{const WSAENOTSOCK} = undefined
+      -- | err == #{const WSAEOPNOTSUPP} = undefined
+      -- | err == #{const WSAESHUTDOWN} = undefined
+      -- | err == #{const WSAETIMEDOUT} = undefined
+      -- | err == #{const WSAEWOULDBLOCK} = undefined
+      -- | err == #{const WSANOTINITIALISED} = undefined
+
+      -- | err == #{const WSA_IO_PENDING} = undefined
+      -- | err == #{const WSA_OPERATION_ABORTED} = undefined
+
+      | err == #{const ERROR_SUCCESS} = Mgr.ioSuccess $ fromIntegral dwBytes
+      | otherwise = Mgr.ioFailed err
 # endif /* HAS_WINIO */
 #endif /* mingw32_HOST_OS */
 
@@ -381,14 +399,12 @@ recvBufMsgWinIO fd msgHdrPtr = do
     -- (socket already associated in socket creation)
     let handle = wordPtrToPtr $ fromIntegral fd
         startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
-        startCB lpOverlapped = alloca $ \pBytesRecvd -> do
-          ret <- c_recvmsg fd msgHdrPtr pBytesRecvd (castPtr lpOverlapped) nullPtr
+        startCB lpOverlapped = do
+          ret <- c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr
           -- IMPORTANT: Must get error immediately after WSARecvMsg before any other IO!
           err <- if ret == (-1) then c_WSAGetLastError else return 0
           if ret == 0
-            then do
-              bytes <- peek pBytesRecvd
-              return $ Mgr.CbDone (Just $ fromIntegral bytes)  -- Immediate success
+            then return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
             else do
               if err == #{const ERROR_IO_PENDING}
                 then return Mgr.CbPending  -- Async pending (will be completed by I/O manager)
