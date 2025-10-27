@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 
 ##include "HsNetDef.h"
 #if defined(mingw32_HOST_OS)
@@ -173,7 +174,6 @@ recvBufMIO s ptr nbytes = do
     return $ fromIntegral len
 
 # if defined(HAS_WINIO)
--- WinIO implementation using withOverlapped
 recvBufWinIO :: Socket -> Ptr Word8 -> Int -> IO Int
 recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
     fmap fromIntegral $ Mgr.withException "recvBuf" $
@@ -186,38 +186,39 @@ recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
         with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
           c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr >>= \case
             0 -> return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
-            ret -> do
-              err <- if ret == (-1) then c_WSAGetLastError else return 0
-              return $ if err == #{const ERROR_IO_PENDING} then Mgr.CbPending else Mgr.CbError (fromIntegral err)
+            (-1) -> return $ Mgr.CbError (-1)
+            _ -> return $ Mgr.CbPending
 
-    completionCB err dwBytes
-      -- https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv#return-value
-      | err == 996 = do
-          putStrLn "Matched ERROR_IO_INCOMPLETE (996)" -- TODO: ???
-          Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE: I/O operation incomplete (e.g., during shutdown)
-      | err == #{const WSAECONNABORTED} = Mgr.ioSuccess 0  -- Connection aborted
-      | err == #{const WSAECONNRESET} = Mgr.ioSuccess 0  -- Connection reset
-      | err == #{const WSAEDISCON} = Mgr.ioSuccess 0  -- Graceful shutdown
-      -- | err == #{const WSAEFAULT} = undefined
-      -- | err == #{const WSAEINPROGRESS} = undefined
-      -- | err == #{const WSAEINTR} = undefined
-      -- | err == #{const WSAEINVAL} = undefined
-      -- | err == #{const WSAEMSGSIZE} = undefined
-      -- | err == #{const WSAENETDOWN} = undefined
-      -- | err == #{const WSAENETRESET} = undefined
-      -- | err == #{const WSAENOTCONN} = undefined
-      -- | err == #{const WSAENOTSOCK} = undefined
-      -- | err == #{const WSAEOPNOTSUPP} = undefined
-      -- | err == #{const WSAESHUTDOWN} = undefined
-      -- | err == #{const WSAETIMEDOUT} = undefined
-      -- | err == #{const WSAEWOULDBLOCK} = undefined
-      -- | err == #{const WSANOTINITIALISED} = undefined
+    completionCB' err dwBytes = do
+      putStrLn [i|completionCB: #{err}, #{dwBytes}|]
+      if
+        -- https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv#return-value
+        | err == 996 = do
+            putStrLn "Matched ERROR_IO_INCOMPLETE (996)" -- TODO: ???
+            Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE: I/O operation incomplete (e.g., during shutdown)
+        | err == #{const WSAECONNABORTED} = Mgr.ioSuccess 0  -- Connection aborted
+        | err == #{const WSAECONNRESET} = Mgr.ioSuccess 0  -- Connection reset
+        | err == #{const WSAEDISCON} = Mgr.ioSuccess 0  -- Graceful shutdown
+        -- | err == #{const WSAEFAULT} = undefined
+        -- | err == #{const WSAEINPROGRESS} = undefined
+        -- | err == #{const WSAEINTR} = undefined
+        -- | err == #{const WSAEINVAL} = undefined
+        -- | err == #{const WSAEMSGSIZE} = undefined
+        -- | err == #{const WSAENETDOWN} = undefined
+        -- | err == #{const WSAENETRESET} = undefined
+        -- | err == #{const WSAENOTCONN} = undefined
+        -- | err == #{const WSAENOTSOCK} = undefined
+        -- | err == #{const WSAEOPNOTSUPP} = undefined
+        -- | err == #{const WSAESHUTDOWN} = undefined
+        -- | err == #{const WSAETIMEDOUT} = undefined
+        -- | err == #{const WSAEWOULDBLOCK} = undefined
+        -- | err == #{const WSANOTINITIALISED} = undefined
 
-      -- | err == #{const WSA_IO_PENDING} = undefined
-      -- | err == #{const WSA_OPERATION_ABORTED} = undefined
+        -- | err == #{const WSA_IO_PENDING} = undefined
+        -- | err == #{const WSA_OPERATION_ABORTED} = undefined
 
-      | err == #{const ERROR_SUCCESS} = Mgr.ioSuccess $ fromIntegral dwBytes
-      | otherwise = Mgr.ioFailed err
+        | err == #{const ERROR_SUCCESS} = Mgr.ioSuccess $ fromIntegral dwBytes
+        | otherwise = Mgr.ioFailed err
 # endif /* HAS_WINIO */
 #endif /* mingw32_HOST_OS */
 
@@ -397,21 +398,15 @@ recvBufMsgWinIO :: CSocket -> Ptr (MsgHdr sa) -> IO Int
 recvBufMsgWinIO fd msgHdrPtr = do
     -- Perform async WSARecvMsg using withOverlapped
     -- (socket already associated in socket creation)
-    let handle = wordPtrToPtr $ fromIntegral fd
-        startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
-        startCB lpOverlapped = do
-          ret <- c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr
-          -- IMPORTANT: Must get error immediately after WSARecvMsg before any other IO!
-          err <- if ret == (-1) then c_WSAGetLastError else return 0
-          if ret == 0
-            then return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
-            else do
-              if err == #{const ERROR_IO_PENDING}
-                then return Mgr.CbPending  -- Async pending (will be completed by I/O manager)
-                else return $ Mgr.CbError (fromIntegral err)   -- Actual error
     fmap fromIntegral $ Mgr.withException "recvMsg" $
-      Mgr.withOverlapped "recvMsg" handle 0 startCB completionCB
+      Mgr.withOverlapped "recvMsg" (wordPtrToPtr $ fromIntegral fd) 0 startCB completionCB
   where
+    startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
+    startCB lpOverlapped =
+      c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr >>= \case
+        0 -> return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
+        (-1) -> return $ Mgr.CbError (-1)
+        _ -> return $ Mgr.CbPending
 
     completionCB err dwBytes
       | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
