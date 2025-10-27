@@ -246,7 +246,9 @@ spec = do
     describe "gracefulClose" $ do
         it "does not send TCP RST back" $ do
             let server sock = do
+                    putStrLn "DOING gracefulClose"
                     gracefulClose sock 3000
+                    putStrLn "DID gracefulClose"
                 client sock = do
                     return ()
             tcpTest client server

@@ -22,8 +22,8 @@ import Foreign.C.Error (getErrno, eAGAIN, eWOULDBLOCK)
 #else
 import Foreign.Ptr (nullPtr)
 #endif
-import Foreign.Marshal.Alloc (alloca, allocaBytes)
-import Foreign.Marshal.Utils (with)
+import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc)
+import Foreign.Marshal.Utils (with, new)
 import GHC.IO.Exception (IOErrorType(InvalidArgument))
 import System.IO.Error (mkIOError, ioeSetErrorString, catchIOError)
 
@@ -176,21 +176,27 @@ recvBufMIO s ptr nbytes = do
 # if defined(HAS_WINIO)
 recvBufWinIO :: Socket -> Ptr Word8 -> Int -> IO Int
 recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
-    fmap fromIntegral $ Mgr.withException "recvBuf" $
-      Mgr.withOverlapped "recvBuf" (wordPtrToPtr $ fromIntegral sock) 0 (startCB sock) completionCB
+    fmap fromIntegral $ do
+      putStrLn "BEFORE withOverlapped call"
+      result <- Mgr.withOverlapped "recvBuf" (wordPtrToPtr $ fromIntegral sock) 0 (startCB sock) completionCB
+      putStrLn "AFTER withOverlapped call"
+      case result of
+        Mgr.IOSuccess x -> putStrLn ("withOverlapped success result: " <> show x)
+        Mgr.IOFailed maybeErr -> putStrLn ("withOverlapped err result: " <> show maybeErr)
+      return 0
   where
     startCB :: CSocket -> Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
     startCB sock lpOverlapped = do
-      alloca $ \flags -> do
-        poke flags 0
-        with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
-          c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr >>= \case
-            0 -> do
-              putStrLn ("startCB: returning CbDone Nothing")
-              return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
-            _ -> do
-              putStrLn ("startCB: returning CbPending")
-              return $ Mgr.CbPending
+      flags <- malloc
+      poke flags 0
+      pWsaBuf <- new (WSABuf (castPtr ptr) (fromIntegral nbytes))
+      c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr >>= \case
+        0 -> do
+          putStrLn ("startCB: returning CbDone Nothing")
+          return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
+        _ -> do
+          putStrLn ("startCB: returning CbNone False")
+          return $ Mgr.CbNone False
 
     completionCB err dwBytes = do
       putStrLn ("completionCB err: " <> show err)
