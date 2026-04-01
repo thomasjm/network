@@ -184,13 +184,9 @@ recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
             poke flags 0
             with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
                 ret <- c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr
-                -- Must call WSAGetLastError immediately, before any other IO
-                err <- c_WSAGetLastError
                 if ret == 0
                     then return $ Mgr.CbDone Nothing
-                    else if err == 997  -- WSA_IO_PENDING
-                        then return Mgr.CbPending
-                        else return $ Mgr.CbError (fromIntegral err)
+                    else return Mgr.CbPending
 
     -- https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv#return-value
     completionCB err dwBytes
@@ -388,14 +384,10 @@ recvBufMsgWinIO fd msgHdrPtr = do
   where
     startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
     startCB lpOverlapped = do
-      ret <- c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr
-      -- Must call WSAGetLastError immediately, before any other IO
-      err <- c_WSAGetLastError
-      if ret == 0
-        then return $ Mgr.CbDone Nothing
-        else if err == 997  -- WSA_IO_PENDING
-          then return Mgr.CbPending
-          else return $ Mgr.CbError (fromIntegral err)
+        ret <- c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr
+        if ret == 0
+            then return $ Mgr.CbDone Nothing
+            else return Mgr.CbPending
 
     completionCB err dwBytes
       | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
