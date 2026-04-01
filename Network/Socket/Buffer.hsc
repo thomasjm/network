@@ -121,7 +121,31 @@ sendBuf s str len = fromIntegral <$> do
 recvBufFrom :: SocketAddress sa => Socket -> Ptr a -> Int -> IO (Int, sa)
 recvBufFrom s ptr nbytes
     | nbytes <= 0 = ioError (mkInvalidRecvArgError "Network.Socket.recvBufFrom")
-    | otherwise = withNewSocketAddress $ \ptr_sa sz -> alloca $ \ptr_len ->
+    | otherwise   = do
+#if defined(mingw32_HOST_OS)
+# if defined(HAS_WINIO)
+        recvBufFromMIO s ptr nbytes <!> recvBufFromWinIO s ptr nbytes
+# else
+        recvBufFromMIO s ptr nbytes
+# endif
+#else
+        withNewSocketAddress $ \ptr_sa sz -> alloca $ \ptr_len ->
+            withFdSocket s $ \fd -> do
+                poke ptr_len (fromIntegral sz)
+                let cnbytes = fromIntegral nbytes
+                    flags = 0
+                len <- throwSocketErrorWaitRead s "Network.Socket.recvBufFrom" $
+                         c_recvfrom fd ptr cnbytes flags ptr_sa ptr_len
+                sockaddr <- peekSocketAddress ptr_sa
+                    `catchIOError` \_ -> getPeerName s
+                return (fromIntegral len, sockaddr)
+#endif
+
+#if defined(mingw32_HOST_OS)
+-- MIO (old I/O manager) implementation
+recvBufFromMIO :: SocketAddress sa => Socket -> Ptr a -> Int -> IO (Int, sa)
+recvBufFromMIO s ptr nbytes =
+    withNewSocketAddress $ \ptr_sa sz -> alloca $ \ptr_len ->
         withFdSocket s $ \fd -> do
             poke ptr_len (fromIntegral sz)
             let cnbytes = fromIntegral nbytes
@@ -131,6 +155,51 @@ recvBufFrom s ptr nbytes
             sockaddr <- peekSocketAddress ptr_sa
                 `catchIOError` \_ -> getPeerName s
             return (fromIntegral len, sockaddr)
+
+# if defined(HAS_WINIO)
+recvBufFromWinIO :: SocketAddress sa => Socket -> Ptr a -> Int -> IO (Int, sa)
+recvBufFromWinIO s ptr nbytes =
+    withNewSocketAddress $ \ptr_sa sz -> alloca $ \ptr_len ->
+        withFdSocket s $ \sock -> do
+            poke ptr_len (fromIntegral sz)
+            len <- fmap fromIntegral $ Mgr.withException "recvBufFrom" $
+                Mgr.withOverlapped "recvBufFrom" (wordPtrToPtr $ fromIntegral sock) 0
+                    (startCB sock ptr_sa ptr_len) completionCB
+            sockaddr <- peekSocketAddress ptr_sa
+                `catchIOError` \_ -> getPeerName s
+            return (len, sockaddr)
+  where
+    startCB :: CSocket -> Ptr sa -> Ptr CInt -> Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
+    startCB sock ptr_sa ptr_len lpOverlapped = do
+        alloca $ \flags -> do
+            poke flags 0
+            with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
+                ret <- c_WSARecvFrom sock pWsaBuf 1 nullPtr flags ptr_sa ptr_len (castPtr lpOverlapped) nullPtr
+                -- Check WSAGetLastError immediately: if the operation didn't
+                -- complete synchronously (ret /= 0), we must distinguish
+                -- ERROR_IO_PENDING (async completion forthcoming) from real
+                -- errors (no IOCP notification will arrive, so CbPending
+                -- would hang forever).
+                err <- c_WSAGetLastError
+                if ret == 0
+                    then return $ Mgr.CbDone Nothing
+                    else if err == #{const ERROR_IO_PENDING}
+                        then return Mgr.CbPending
+                        else return $ Mgr.CbError (fromIntegral err)
+
+    completionCB err dwBytes
+        | err == #{const ERROR_SUCCESS}           = Mgr.ioSuccess $ fromIntegral dwBytes
+        | err == #{const WSAECONNABORTED}         = Mgr.ioSuccess 0
+        | err == #{const WSAECONNRESET}           = Mgr.ioSuccess 0
+        | err == #{const WSAEDISCON}              = Mgr.ioSuccess 0
+        | err == #{const ERROR_HANDLE_EOF}        = Mgr.ioSuccess 0
+        | err == #{const ERROR_BROKEN_PIPE}       = Mgr.ioSuccess 0
+        | err == #{const ERROR_NO_MORE_ITEMS}     = Mgr.ioSuccess 0
+        | err == #{const ERROR_OPERATION_ABORTED} = Mgr.ioSuccess 0
+        | err == 996                              = Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE
+        | otherwise                               = Mgr.ioFailed err
+# endif /* HAS_WINIO */
+#endif /* mingw32_HOST_OS */
 
 -- | Receive data from the socket.  The socket must be in a connected
 -- state. This function may return fewer bytes than specified.  If the
@@ -184,9 +253,17 @@ recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
             poke flags 0
             with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
                 ret <- c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr
+                -- Check WSAGetLastError immediately: if the operation didn't
+                -- complete synchronously (ret /= 0), we must distinguish
+                -- ERROR_IO_PENDING (async completion forthcoming) from real
+                -- errors (no IOCP notification will arrive, so CbPending
+                -- would hang forever).
+                err <- c_WSAGetLastError
                 if ret == 0
                     then return $ Mgr.CbDone Nothing
-                    else return Mgr.CbPending
+                    else if err == #{const ERROR_IO_PENDING}
+                        then return Mgr.CbPending
+                        else return $ Mgr.CbError (fromIntegral err)
 
     -- https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv#return-value
     completionCB err dwBytes
@@ -366,6 +443,8 @@ foreign import CALLCONV SAFE_ON_WIN "WSARecvMsg"
   c_recvmsg :: CSocket -> Ptr (MsgHdr sa) -> LPDWORD -> Ptr () -> Ptr () -> IO CInt
 foreign import CALLCONV unsafe "WSARecv"
   c_WSARecv :: CSocket -> Ptr WSABuf -> DWORD -> LPDWORD -> LPDWORD -> Ptr () -> Ptr () -> IO CInt
+foreign import CALLCONV unsafe "WSARecvFrom"
+  c_WSARecvFrom :: CSocket -> Ptr WSABuf -> DWORD -> LPDWORD -> LPDWORD -> Ptr sa -> Ptr CInt -> Ptr () -> Ptr () -> IO CInt
 
 -- Helper functions for recvBufMsg on Windows
 recvBufMsgMIO :: CSocket -> Ptr (MsgHdr sa) -> IO Int
@@ -385,9 +464,17 @@ recvBufMsgWinIO fd msgHdrPtr = do
     startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
     startCB lpOverlapped = do
         ret <- c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr
+        -- Check WSAGetLastError immediately: if the operation didn't
+        -- complete synchronously (ret /= 0), we must distinguish
+        -- ERROR_IO_PENDING (async completion forthcoming) from real
+        -- errors (no IOCP notification will arrive, so CbPending
+        -- would hang forever).
+        err <- c_WSAGetLastError
         if ret == 0
             then return $ Mgr.CbDone Nothing
-            else return Mgr.CbPending
+            else if err == #{const ERROR_IO_PENDING}
+                then return Mgr.CbPending
+                else return $ Mgr.CbError (fromIntegral err)
 
     completionCB err dwBytes
       | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
