@@ -210,7 +210,12 @@ listen s backlog = withFdSocket s $ \fd -> do
 accept :: SocketAddress sa => Socket -> IO (Socket, sa)
 accept listing_sock = withNewSocketAddress $ \new_sa sz ->
     withFdSocket listing_sock $ \listing_fd -> do
- new_sock <- E.bracketOnError (callAccept listing_fd new_sa sz) c_close mkSocket
+ new_sock <- E.bracketOnError (callAccept listing_fd new_sa sz) c_close $ \fd -> do
+#if defined(HAS_WINIO)
+     -- Associate accepted socket with I/O manager if using WinIO
+     (return () <!> Mgr.associateHandle' (wordPtrToPtr $ fromIntegral fd))
+#endif
+     mkSocket fd
  new_addr <- peekSocketAddress new_sa
  return (new_sock, new_addr)
   where

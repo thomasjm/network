@@ -1,6 +1,5 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiWayIf #-}
 
 ##include "HsNetDef.h"
 #if defined(mingw32_HOST_OS)
@@ -177,48 +176,34 @@ recvBufMIO s ptr nbytes = do
 recvBufWinIO :: Socket -> Ptr Word8 -> Int -> IO Int
 recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
     fmap fromIntegral $ Mgr.withException "recvBuf" $
-      Mgr.withOverlapped "recvBuf" (wordPtrToPtr $ fromIntegral sock) 0 (startCB sock) completionCB
+        Mgr.withOverlapped "recvBuf" (wordPtrToPtr $ fromIntegral sock) 0 (startCB sock) completionCB
   where
     startCB :: CSocket -> Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
     startCB sock lpOverlapped = do
-      alloca $ \flags -> do
-        poke flags 0
-        with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
-          c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr >>= \case
-            0 -> return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
-            (-1) -> return $ Mgr.CbError (-1)
-            _ -> return $ Mgr.CbPending
+        alloca $ \flags -> do
+            poke flags 0
+            with (WSABuf (castPtr ptr) (fromIntegral nbytes)) $ \pWsaBuf -> do
+                ret <- c_WSARecv sock pWsaBuf 1 nullPtr flags (castPtr lpOverlapped) nullPtr
+                -- Must call WSAGetLastError immediately, before any other IO
+                err <- c_WSAGetLastError
+                if ret == 0
+                    then return $ Mgr.CbDone Nothing
+                    else if err == 997  -- WSA_IO_PENDING
+                        then return Mgr.CbPending
+                        else return $ Mgr.CbError (fromIntegral err)
 
-    completionCB' err dwBytes = do
-      putStrLn [i|completionCB: #{err}, #{dwBytes}|]
-      if
-        -- https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv#return-value
-        | err == 996 = do
-            putStrLn "Matched ERROR_IO_INCOMPLETE (996)" -- TODO: ???
-            Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE: I/O operation incomplete (e.g., during shutdown)
-        | err == #{const WSAECONNABORTED} = Mgr.ioSuccess 0  -- Connection aborted
-        | err == #{const WSAECONNRESET} = Mgr.ioSuccess 0  -- Connection reset
-        | err == #{const WSAEDISCON} = Mgr.ioSuccess 0  -- Graceful shutdown
-        -- | err == #{const WSAEFAULT} = undefined
-        -- | err == #{const WSAEINPROGRESS} = undefined
-        -- | err == #{const WSAEINTR} = undefined
-        -- | err == #{const WSAEINVAL} = undefined
-        -- | err == #{const WSAEMSGSIZE} = undefined
-        -- | err == #{const WSAENETDOWN} = undefined
-        -- | err == #{const WSAENETRESET} = undefined
-        -- | err == #{const WSAENOTCONN} = undefined
-        -- | err == #{const WSAENOTSOCK} = undefined
-        -- | err == #{const WSAEOPNOTSUPP} = undefined
-        -- | err == #{const WSAESHUTDOWN} = undefined
-        -- | err == #{const WSAETIMEDOUT} = undefined
-        -- | err == #{const WSAEWOULDBLOCK} = undefined
-        -- | err == #{const WSANOTINITIALISED} = undefined
-
-        -- | err == #{const WSA_IO_PENDING} = undefined
-        -- | err == #{const WSA_OPERATION_ABORTED} = undefined
-
-        | err == #{const ERROR_SUCCESS} = Mgr.ioSuccess $ fromIntegral dwBytes
-        | otherwise = Mgr.ioFailed err
+    -- https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv#return-value
+    completionCB err dwBytes
+        | err == #{const ERROR_SUCCESS}           = Mgr.ioSuccess $ fromIntegral dwBytes
+        | err == #{const WSAECONNABORTED}         = Mgr.ioSuccess 0
+        | err == #{const WSAECONNRESET}           = Mgr.ioSuccess 0
+        | err == #{const WSAEDISCON}              = Mgr.ioSuccess 0
+        | err == #{const ERROR_HANDLE_EOF}        = Mgr.ioSuccess 0
+        | err == #{const ERROR_BROKEN_PIPE}       = Mgr.ioSuccess 0
+        | err == #{const ERROR_NO_MORE_ITEMS}     = Mgr.ioSuccess 0
+        | err == #{const ERROR_OPERATION_ABORTED} = Mgr.ioSuccess 0
+        | err == 996                              = Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE
+        | otherwise                               = Mgr.ioFailed err
 # endif /* HAS_WINIO */
 #endif /* mingw32_HOST_OS */
 
@@ -402,19 +387,28 @@ recvBufMsgWinIO fd msgHdrPtr = do
       Mgr.withOverlapped "recvMsg" (wordPtrToPtr $ fromIntegral fd) 0 startCB completionCB
   where
     startCB :: Mgr.LPOVERLAPPED -> IO (Mgr.CbResult Int)
-    startCB lpOverlapped =
-      c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr >>= \case
-        0 -> return $ Mgr.CbDone Nothing  -- Immediate success, bytes will come from completion
-        (-1) -> return $ Mgr.CbError (-1)
-        _ -> return $ Mgr.CbPending
+    startCB lpOverlapped = do
+      ret <- c_recvmsg fd msgHdrPtr nullPtr (castPtr lpOverlapped) nullPtr
+      -- Must call WSAGetLastError immediately, before any other IO
+      err <- c_WSAGetLastError
+      if ret == 0
+        then return $ Mgr.CbDone Nothing
+        else if err == 997  -- WSA_IO_PENDING
+          then return Mgr.CbPending
+          else return $ Mgr.CbError (fromIntegral err)
 
     completionCB err dwBytes
       | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
-      | err == #{const WSAEMSGSIZE}      = Mgr.ioSuccess $ fromIntegral dwBytes  -- Message was truncated but data received
-      | err == #{const WSAECONNRESET}    = Mgr.ioSuccess 0  -- Connection reset
-      | err == #{const WSAECONNABORTED}  = Mgr.ioSuccess 0  -- Connection aborted
-      | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0  -- Socket shut down
-      | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0  -- Graceful shutdown
+      | err == #{const WSAEMSGSIZE}      = Mgr.ioSuccess $ fromIntegral dwBytes
+      | err == #{const WSAECONNRESET}    = Mgr.ioSuccess 0
+      | err == #{const WSAECONNABORTED}  = Mgr.ioSuccess 0
+      | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0
+      | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0
+      | err == #{const ERROR_HANDLE_EOF}      = Mgr.ioSuccess 0
+      | err == #{const ERROR_BROKEN_PIPE}     = Mgr.ioSuccess 0
+      | err == #{const ERROR_NO_MORE_ITEMS}   = Mgr.ioSuccess 0
+      | err == #{const ERROR_OPERATION_ABORTED} = Mgr.ioSuccess 0
+      | err == 996                       = Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE
       | otherwise                        = Mgr.ioFailed err
 # endif /* HAS_WINIO */
 #endif /* mingw32_HOST_OS */
