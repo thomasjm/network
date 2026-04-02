@@ -3,9 +3,10 @@
 
 ##include "HsNetDef.h"
 #if defined(mingw32_HOST_OS)
-#  include "windows.h"
 #  include "winsock2.h"
+#  include "windows.h"
 #  include "mswsock.h"
+#  include "ntstatus.h"
 #endif
 
 module Network.Socket.Buffer (
@@ -486,7 +487,7 @@ recvBufMsgWinIO fd msgHdrPtr = do
     completionCB err dwBytes
       | err == #{const ERROR_SUCCESS}           = Mgr.ioSuccess $ fromIntegral dwBytes
       | err == #{const WSAEMSGSIZE}             = Mgr.ioSuccess $ fromIntegral dwBytes
-      | err == 0x80000005                       = Mgr.ioSuccess $ fromIntegral dwBytes  -- STATUS_BUFFER_OVERFLOW (truncated msg)
+      | err == #{const STATUS_BUFFER_OVERFLOW}   = Mgr.ioSuccess $ fromIntegral dwBytes  -- truncated msg
       | err == #{const WSAECONNRESET}           = Mgr.ioSuccess 0
       | err == #{const WSAECONNABORTED}         = Mgr.ioSuccess 0
       | err == #{const WSAESHUTDOWN}            = Mgr.ioSuccess 0
