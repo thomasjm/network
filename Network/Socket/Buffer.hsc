@@ -4,6 +4,8 @@
 ##include "HsNetDef.h"
 #if defined(mingw32_HOST_OS)
 #  include "windows.h"
+#  include "winsock2.h"
+#  include "mswsock.h"
 #endif
 
 module Network.Socket.Buffer (
@@ -196,7 +198,7 @@ recvBufFromWinIO s ptr nbytes =
         | err == #{const ERROR_BROKEN_PIPE}       = Mgr.ioSuccess 0
         | err == #{const ERROR_NO_MORE_ITEMS}     = Mgr.ioSuccess 0
         | err == #{const ERROR_OPERATION_ABORTED} = Mgr.ioSuccess 0
-        | err == 996                              = Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE
+        | err == #{const ERROR_IO_INCOMPLETE}     = Mgr.ioSuccess 0
         | otherwise                               = Mgr.ioFailed err
 # endif /* HAS_WINIO */
 #endif /* mingw32_HOST_OS */
@@ -275,7 +277,7 @@ recvBufWinIO s ptr nbytes = withFdSocket s $ \sock ->
         | err == #{const ERROR_BROKEN_PIPE}       = Mgr.ioSuccess 0
         | err == #{const ERROR_NO_MORE_ITEMS}     = Mgr.ioSuccess 0
         | err == #{const ERROR_OPERATION_ABORTED} = Mgr.ioSuccess 0
-        | err == 996                              = Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE
+        | err == #{const ERROR_IO_INCOMPLETE}     = Mgr.ioSuccess 0
         | otherwise                               = Mgr.ioFailed err
 # endif /* HAS_WINIO */
 #endif /* mingw32_HOST_OS */
@@ -420,8 +422,13 @@ recvBufMsg s bufsizs clen flags = do
 #endif
             sockaddr <- peekSocketAddress addrPtr `catchIOError` \_ -> getPeerName s
             hdr <- peek msgHdrPtr
-            cmsgs <- parseCmsgs msgHdrPtr
-            let flags' = MsgFlag $ fromIntegral $ msgFlags hdr
+            let rawFlags = msgFlags hdr
+                flags' = MsgFlag $ fromIntegral rawFlags
+            -- If the control buffer was truncated (MSG_CTRUNC), the
+            -- control data may be invalid and parsing could segfault.
+            cmsgs <- if msgCtrl hdr == nullPtr || (rawFlags .&. #{const MSG_CTRUNC}) /= 0
+                        then return []
+                        else parseCmsgs msgHdrPtr
             return (sockaddr, len, cmsgs, flags')
 
 #if !defined(mingw32_HOST_OS)
@@ -477,18 +484,19 @@ recvBufMsgWinIO fd msgHdrPtr = do
                 else return $ Mgr.CbError (fromIntegral err)
 
     completionCB err dwBytes
-      | err == #{const ERROR_SUCCESS}    = Mgr.ioSuccess $ fromIntegral dwBytes
-      | err == #{const WSAEMSGSIZE}      = Mgr.ioSuccess $ fromIntegral dwBytes
-      | err == #{const WSAECONNRESET}    = Mgr.ioSuccess 0
-      | err == #{const WSAECONNABORTED}  = Mgr.ioSuccess 0
-      | err == #{const WSAESHUTDOWN}     = Mgr.ioSuccess 0
-      | err == #{const WSAEDISCON}       = Mgr.ioSuccess 0
-      | err == #{const ERROR_HANDLE_EOF}      = Mgr.ioSuccess 0
-      | err == #{const ERROR_BROKEN_PIPE}     = Mgr.ioSuccess 0
-      | err == #{const ERROR_NO_MORE_ITEMS}   = Mgr.ioSuccess 0
+      | err == #{const ERROR_SUCCESS}           = Mgr.ioSuccess $ fromIntegral dwBytes
+      | err == #{const WSAEMSGSIZE}             = Mgr.ioSuccess $ fromIntegral dwBytes
+      | err == 0x80000005                       = Mgr.ioSuccess $ fromIntegral dwBytes  -- STATUS_BUFFER_OVERFLOW (truncated msg)
+      | err == #{const WSAECONNRESET}           = Mgr.ioSuccess 0
+      | err == #{const WSAECONNABORTED}         = Mgr.ioSuccess 0
+      | err == #{const WSAESHUTDOWN}            = Mgr.ioSuccess 0
+      | err == #{const WSAEDISCON}              = Mgr.ioSuccess 0
+      | err == #{const ERROR_HANDLE_EOF}        = Mgr.ioSuccess 0
+      | err == #{const ERROR_BROKEN_PIPE}       = Mgr.ioSuccess 0
+      | err == #{const ERROR_NO_MORE_ITEMS}     = Mgr.ioSuccess 0
       | err == #{const ERROR_OPERATION_ABORTED} = Mgr.ioSuccess 0
-      | err == 996                       = Mgr.ioSuccess 0  -- ERROR_IO_INCOMPLETE
-      | otherwise                        = Mgr.ioFailed err
+      | err == #{const ERROR_IO_INCOMPLETE}     = Mgr.ioSuccess 0
+      | otherwise                               = Mgr.ioFailed err
 # endif /* HAS_WINIO */
 #endif /* mingw32_HOST_OS */
 
